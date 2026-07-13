@@ -1,0 +1,51 @@
+{
+  "name": "@satas/pi-usage-bar",
+  "version": "0.1.0",
+  "description": "AI subscription usage gauge for the pi coding agent — Claude Pro/Max and ChatGPT Plus/Pro quota bars with provider status (incident) alerts, below the editor.",
+  "keywords": [
+    "pi-package",
+    "pi-coding-agent",
+    "pi-agent",
+    "usage",
+    "quota",
+    "rate-limit",
+    "status",
+    "incident",
+    "claude",
+    "anthropic",
+    "chatgpt",
+    "codex",
+    "openai"
+  ],
+  "license": "MIT",
+  "author": "satas20",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/satas20/pi-usage-bar.git"
+  },
+  "homepage": "https://github.com/satas20/pi-usage-bar#readme",
+  "bugs": {
+    "url": "https://github.com/satas20/pi-usage-bar/issues"
+  },
+  "files": [
+    "extensions",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.6",
+    "@types/node": "^26.1.1",
+    "typescript": "^5.9.3"
+  }
+}
