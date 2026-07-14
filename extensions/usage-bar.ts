@@ -4,7 +4,7 @@
  * Renders a compact usage strip in the footer status line:
  *
  *   ▓▓▓▓░░ 65% · 0h 11m                                  (one window)
- *   cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h  │  oai ▓░░░░ 12% · 3h 4m
+ *   cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h │ oai ▓░░░░ 12% · 3h 4m
  *   ! cld ▓▓▓▓░ 65% · 0h 11m                             (anthropic incident)
  *
  * Providers:
@@ -501,14 +501,20 @@ async function writeCache(cache: UsageCache): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  let timers: ReturnType<typeof setTimeout>[] = [];
+  // One pending poll timer per provider (replaced on every reschedule).
+  const timers = new Map<ProviderId, ReturnType<typeof setTimeout>>();
   let ticker: ReturnType<typeof setInterval> | undefined;
+  // Bumped on every start/stop; in-flight polls from a previous session
+  // compare against it and bail instead of rendering into a stale UI or
+  // rescheduling themselves (which would double the polling forever).
+  let generation = 0;
   let started = false;
   let lastLine: string | undefined;
 
   const stop = (ctx?: ExtensionContext) => {
-    for (const t of timers) clearTimeout(t);
-    timers = [];
+    generation++;
+    for (const t of timers.values()) clearTimeout(t);
+    timers.clear();
     if (ticker) clearInterval(ticker);
     ticker = undefined;
     started = false;
@@ -522,6 +528,7 @@ export default function (pi: ExtensionAPI) {
     if (!ctx.hasUI) return; // print/RPC mode — no UI to render into
     if (started) return; // session switch within the same runtime
     started = true;
+    const gen = ++generation;
 
     const config = await loadConfig();
     const enabled = providers.filter((p) => config.providers[p.id].enabled);
@@ -530,17 +537,23 @@ export default function (pi: ExtensionAPI) {
     const byProvider: UsageCache = {};
     // Usage is seeded from the cache so the bar appears instantly; status is
     // deliberately not cached across restarts (incidents are short-lived, and
-    // the first poll lands seconds after startup anyway).
+    // the first poll lands seconds after startup anyway). The seed is filtered
+    // through the *current* config so stale window kinds don't flash.
     const cached = await readCache();
     for (const p of enabled) {
       const windows = cached[p.id];
-      if (Array.isArray(windows)) byProvider[p.id] = windows;
+      if (Array.isArray(windows))
+        byProvider[p.id] = windows.filter(
+          (w) => config.providers[p.id].show[w.category],
+        );
     }
+    if (gen !== generation) return; // stopped while awaiting
     const byStatus: Partial<Record<ProviderId, StatusIndicator>> = {};
 
     // -- rendering ----------------------------------------------------------
 
     const render = () => {
+      if (gen !== generation) return; // session ended — never touch stale UI
       const theme = ctx.ui.theme;
       const now = Date.now();
 
@@ -606,10 +619,13 @@ export default function (pi: ExtensionAPI) {
               barWidth,
               Math.max(0, Math.round((pctOf(w) / 100) * barWidth)),
             );
-            win.push(
-              theme.fg(colorOf(w), "▓".repeat(filled)) +
-                theme.fg("dim", "░".repeat(barWidth - filled)),
-            );
+            // Skip zero-length spans — theme.fg("", …) would emit bare ANSI codes.
+            const bar =
+              (filled > 0 ? theme.fg(colorOf(w), "▓".repeat(filled)) : "") +
+              (filled < barWidth
+                ? theme.fg("dim", "░".repeat(barWidth - filled))
+                : "");
+            win.push(bar);
           }
           win.push(theme.fg("text", `${pctOf(w)}%`));
           win.push(theme.fg("muted", `· ${fmtDuration(w.resetsAt - now)}`));
@@ -618,7 +634,8 @@ export default function (pi: ExtensionAPI) {
         parts.push(seg.join(" "));
       }
 
-      const line = parts.join("  │  ");
+      // Single spaces: pi's status-line sanitizer collapses runs of spaces.
+      const line = parts.join(" │ ");
       if (line !== lastLine) {
         lastLine = line;
         ctx.ui.setStatus(WIDGET_KEY, line);
@@ -635,6 +652,7 @@ export default function (pi: ExtensionAPI) {
         const statusP =
           config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null;
         const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP]);
+        if (gen !== generation) return; // session ended while fetching
         if (all) {
           const windows = all.filter(
             (w) => cfg.show[w.category] && w.resetsAt > Date.now(),
@@ -647,7 +665,7 @@ export default function (pi: ExtensionAPI) {
         render();
         // Back off when the usage fetch failed (e.g. 429 — these endpoints
         // throttle aggressive polling).
-        timers.push(setTimeout(poll, all ? POLL_MS : POLL_MS * 3));
+        timers.set(p.id, setTimeout(poll, all ? POLL_MS : POLL_MS * 3));
       };
       void poll();
     }

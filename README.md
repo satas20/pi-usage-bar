@@ -17,7 +17,7 @@ It also watches each vendor's public status page and prepends a color-coded
 With multiple windows/providers enabled:
 
 ```
- cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h  │  oai ▓░░░░ 12% · 3h 4m
+ cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h │ oai ▓░░░░ 12% · 3h 4m
 ```
 
 During a vendor incident:
