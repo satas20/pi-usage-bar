@@ -5,8 +5,8 @@
 An AI subscription usage gauge for the [pi coding agent](https://github.com/badlogic/pi-mono).
 
 Shows how much of your coding-plan quota you've used and how long until it
-resets, in a widget just below the editor. Supports **Claude Pro/Max** and
-**ChatGPT Plus/Pro (Codex)** — each optional, each with per-window toggles.
+resets, in a status line at the bottom of the footer. Supports **Claude Pro/Max**
+and **ChatGPT Plus/Pro (Codex)** — each optional, each with per-window toggles.
 It also watches each vendor's public status page and prepends a color-coded
 `!` marker when there's an active incident — so you know it's them, not you.
 
@@ -17,7 +17,7 @@ It also watches each vendor's public status page and prepends a color-coded
 With multiple windows/providers enabled:
 
 ```
- cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h   oai ▓░░░░ 12% · 3h 4m
+ cld ▓▓▓▓░ 65% · 0h 11m  7d ▓░░░░ 19% · 1d 11h  │  oai ▓░░░░ 12% · 3h 4m
 ```
 
 During a vendor incident:
@@ -32,7 +32,7 @@ During a vendor incident:
   failures — these endpoints throttle aggressive polling).
 - Last known values are cached, so the bar appears instantly on restart.
 - Providers hide silently when credentials are missing/expired or a fetch
-  fails; the whole widget hides when nothing is available.
+  fails; the whole row hides when nothing is available.
 - Provider prefixes (`cld`/`oai`) appear only when two or more providers are
   visible; window labels (`5h`/`7d`/…) appear only when a provider shows two
   or more windows.

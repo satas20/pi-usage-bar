@@ -57,8 +57,10 @@ pi has strict rules for extensions, and this one follows them:
   `stop()`).
 - **Headless-safe.** `ctx.hasUI` is checked before anything else; in
   `pi -p` / CI runs the extension is a complete no-op.
-- **Widget, not footer.** The bar renders via `ctx.ui.setWidget(...)` with
-  `placement: "belowEditor"` and is cleared on shutdown.
+- **Footer status, not widget.** The bar renders via `ctx.ui.setStatus(...)`
+  as the last line of pi's footer (below pwd and stats), and is cleared on
+  shutdown. `setStatus` sanitizes by collapsing multiple spaces, so the
+  multi-provider separator is `│` instead of raw spaces.
 
 ## Adding a provider
 
