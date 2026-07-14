@@ -79,7 +79,7 @@ Checklist:
 
 1. Add the id to the `ProviderId` union.
 2. Implement the provider object; return `UsageWindow[]` (each window has a
-   `category` of `"5h" | "7d" | "model"`, a `percent` 0–100, and `resetsAt`
+   `category` of `"5h" | "7d" | "model" | "mo"`, a `percent` 0–100, and `resetsAt`
    epoch ms) or `null` when credentials are missing/expired or the fetch fails.
 3. Add it to the `providers` array.
 4. Add a section to `DEFAULT_CONFIG_JSON`, an entry in `defaultConfig()`, and

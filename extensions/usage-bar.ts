@@ -8,8 +8,11 @@
  *   ! cld ▓▓▓▓░ 65% · 0h 11m                             (anthropic incident)
  *
  * Providers:
- *   anthropic — Claude Pro/Max via the OAuth token in ~/.claude/.credentials.json
- *   openai    — ChatGPT Plus/Pro via the Codex CLI login in ~/.codex/auth.json
+ *   anthropic      — Claude Pro/Max via the OAuth token in ~/.claude/.credentials.json
+ *   openai         — ChatGPT Plus/Pro via the Codex CLI login in ~/.codex/auth.json
+ *   github-copilot — Copilot monthly premium requests via pi's/opencode's login
+ *   zai            — GLM coding plan (API key: config/env/auth stores)
+ *   kimi           — Kimi coding plan (API key: config/env/auth stores)
  *
  * When a provider's public status page reports an incident, a colored `!`
  * marker appears next to its prefix (red = major/critical, amber = minor,
@@ -43,7 +46,7 @@ const WIDGET_KEY = "usage-bar";
 // ---------------------------------------------------------------------------
 
 /** Which quota window a value belongs to; toggled per provider in config. */
-type WindowCategory = "5h" | "7d" | "model";
+type WindowCategory = "5h" | "7d" | "model" | "mo";
 
 /** Provider health from the vendor's public status page (Statuspage schema). */
 type StatusIndicator = "none" | "minor" | "major" | "critical" | "maintenance";
@@ -58,7 +61,7 @@ type UsageWindow = {
   resetsAt: number;
 };
 
-type ProviderId = "anthropic" | "openai";
+type ProviderId = "anthropic" | "openai" | "github-copilot" | "zai" | "kimi";
 
 type ProviderConfig = {
   enabled: boolean;
@@ -67,6 +70,10 @@ type ProviderConfig = {
   credentialsPath?: string;
   /** openai: path to Codex auth.json */
   codexAuthPath?: string;
+  /** zai/kimi: inline API key (chmod 600 the config if you use this) */
+  apiKey?: string;
+  /** zai/kimi: env var holding the API key */
+  apiKeyEnv?: string;
 };
 
 type UsageBarConfig = {
@@ -156,27 +163,70 @@ async function fetchStatus(url: string): Promise<StatusIndicator | null> {
 }
 
 // ---------------------------------------------------------------------------
-// pi auth store (fallback credential source)
+// Auth stores (fallback credential sources) — read-only, first match wins
 // ---------------------------------------------------------------------------
 
-type PiAuthEntry = {
-  type?: string;
-  access?: string;
-  expires?: number; // epoch ms; 0 = no expiry
+type StoredAuthEntry = {
+  type?: string; // "oauth" | "api"
+  key?: string; // type api
+  access?: string; // type oauth
+  refresh?: string; // type oauth (for github-copilot this is the GitHub token)
+  expires?: number; // epoch ms; 0/absent = no expiry
   accountId?: string;
 };
 
-/** Read a provider's entry from pi's own auth store (`/login` in pi).
- *  Returns null when missing/unreadable. */
-async function piAuth(id: string): Promise<PiAuthEntry | null> {
+/** Return the first matching entry from a JSON auth-store file. */
+async function authStoreEntry(
+  file: string,
+  ids: string[],
+): Promise<StoredAuthEntry | null> {
   try {
-    const auth = JSON.parse(
-      await readFile(join(AGENT_DIR, "auth.json"), "utf8"),
-    ) as Record<string, PiAuthEntry>;
-    return auth[id] ?? null;
+    const auth = JSON.parse(await readFile(file, "utf8")) as Record<
+      string,
+      StoredAuthEntry
+    >;
+    for (const id of ids) if (auth[id]) return auth[id];
+    return null;
   } catch {
     return null;
   }
+}
+
+/** pi's own auth store (`/login` in pi). */
+function piAuth(...ids: string[]) {
+  return authStoreEntry(join(AGENT_DIR, "auth.json"), ids);
+}
+
+/** opencode's auth store — a handy source for API keys (z.ai, Kimi, Copilot)
+ *  when you also use opencode on the same machine. Read-only. */
+function opencodeAuth(...ids: string[]) {
+  const dataDir =
+    process.env["XDG_DATA_HOME"] ?? join(homedir(), ".local", "share");
+  return authStoreEntry(join(dataDir, "opencode", "auth.json"), ids);
+}
+
+/** A stored entry's usable secret: unexpired OAuth access token or API key. */
+function entrySecret(entry: StoredAuthEntry | null): string | undefined {
+  if (!entry) return undefined;
+  if (entry.key) return entry.key;
+  if (entry.access && !(entry.expires && Date.now() >= entry.expires))
+    return entry.access;
+  return undefined;
+}
+
+/** Resolve an API key: inline config value → env var → auth stores. */
+async function resolveApiKey(
+  cfg: ProviderConfig,
+  defaultEnv: string,
+  storeIds: string[],
+): Promise<string | undefined> {
+  if (cfg.apiKey) return cfg.apiKey;
+  const env = process.env[cfg.apiKeyEnv ?? defaultEnv];
+  if (env) return env;
+  return (
+    entrySecret(await piAuth(...storeIds)) ??
+    entrySecret(await opencodeAuth(...storeIds))
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -281,8 +331,9 @@ const openaiProvider: Provider = {
         };
       };
       const tokens = auth.tokens;
-      // Expiry lives in the id_token JWT; skip when (nearly) expired.
-      const exp = tokens?.id_token ? jwtExp(tokens.id_token) : 0;
+      // Check the expiry of the token we actually send (the access token);
+      // the id_token expires much earlier and would cause false negatives.
+      const exp = tokens?.access_token ? jwtExp(tokens.access_token) : 0;
       if (
         tokens?.access_token &&
         !(exp > 0 && exp * 1000 <= Date.now() + 60_000)
@@ -364,7 +415,229 @@ function parseWhamWindow(
   return { category, label: category, percent: w.used_percent, resetsAt };
 }
 
-const providers: Provider[] = [anthropicProvider, openaiProvider];
+/** GitHub Copilot — monthly premium-requests quota via the same internal
+ *  endpoint Copilot's own clients use. The GitHub OAuth token is the `refresh`
+ *  field of the `github-copilot` entry in pi's (or opencode's) auth store. */
+const copilotProvider: Provider = {
+  id: "github-copilot",
+  short: "cop",
+  statusUrl: "https://www.githubstatus.com/api/v2/status.json",
+  async fetchUsage() {
+    const entry =
+      (await piAuth("github-copilot")) ?? (await opencodeAuth("github-copilot"));
+    const token = entry?.refresh;
+    if (!token) return null;
+
+    const data = (await fetchJson(
+      "https://api.github.com/copilot_internal/user",
+      { authorization: `Bearer ${token}`, "user-agent": "pi-usage-bar" },
+    )) as {
+      quota_reset_date?: string;
+      quota_snapshots?: {
+        premium_interactions?: {
+          percent_remaining?: number;
+          unlimited?: boolean;
+        } | null;
+      } | null;
+    } | null;
+
+    const quota = data?.quota_snapshots?.premium_interactions;
+    if (!quota || quota.unlimited) return null;
+    const remaining = quota.percent_remaining;
+    if (typeof remaining !== "number" || !Number.isFinite(remaining))
+      return null;
+    if (!data?.quota_reset_date) return null;
+    // Date-only string ("2026-08-01") parses as UTC midnight.
+    const resetsAt = Date.parse(data.quota_reset_date);
+    if (Number.isNaN(resetsAt)) return null;
+
+    const percent = Math.min(100, Math.max(0, 100 - remaining));
+    return [{ category: "mo", label: "mo", percent, resetsAt }];
+  },
+};
+
+/** Z.ai GLM coding plan — token quotas (5h + weekly) and the monthly tools
+ *  quota. API key from config/env, falling back to pi's and opencode's auth
+ *  stores (`zai-coding-plan`/`zai`). The endpoint takes the raw key. */
+const zaiProvider: Provider = {
+  id: "zai",
+  short: "glm",
+  async fetchUsage(cfg) {
+    const key = await resolveApiKey(cfg, "ZAI_API_KEY", [
+      "zai-coding-plan",
+      "zai",
+    ]);
+    if (!key) return null;
+
+    const data = (await fetchJson(
+      "https://api.z.ai/api/monitor/usage/quota/limit",
+      { authorization: key },
+    )) as {
+      data?: {
+        limits?: Array<{
+          type?: string;
+          unit?: number;
+          number?: number;
+          percentage?: number;
+          nextResetTime?: number;
+        }>;
+      } | null;
+    } | null;
+    if (!data?.data || !Array.isArray(data.data.limits)) return null;
+
+    // `unit` codes observed live: 3 = hours, 6 = weeks, 5 = months.
+    const unitSeconds: Record<number, number> = {
+      3: 3_600,
+      6: 604_800,
+      5: 2_592_000,
+    };
+    const windows: UsageWindow[] = [];
+    for (const limit of data.data.limits) {
+      if (!limit || typeof limit.percentage !== "number") continue;
+      if (!Number.isFinite(limit.percentage)) continue;
+      const resetsAt = limit.nextResetTime;
+      if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) continue;
+      let category: WindowCategory;
+      if (limit.type === "TIME_LIMIT") {
+        category = "mo"; // monthly tools quota (search/reader/zread)
+      } else {
+        const secs =
+          (limit.number ?? 0) * (unitSeconds[limit.unit ?? -1] ?? 0);
+        category = secs > 0 && secs <= 21_600 ? "5h" : "7d";
+      }
+      windows.push({
+        category,
+        label: category,
+        percent: limit.percentage,
+        resetsAt,
+      });
+    }
+    windows.sort(
+      (a, b) => Number(b.category === "5h") - Number(a.category === "5h"),
+    );
+    return windows.length > 0 ? windows : null;
+  },
+};
+
+/** Kimi coding plan — `api.kimi.com/coding/v1/usages`. API key (or OAuth
+ *  token) from config/env, falling back to pi's and opencode's auth stores.
+ *  The response shape varies by plan, so parsing is defensive. */
+const kimiProvider: Provider = {
+  id: "kimi",
+  short: "kmi",
+  async fetchUsage(cfg) {
+    const key = await resolveApiKey(cfg, "KIMI_API_KEY", [
+      "kimi-for-coding",
+      "kimi-code",
+      "kimi",
+      "kimi-for-coding-oauth",
+    ]);
+    if (!key) return null;
+
+    const payload = (await fetchJson("https://api.kimi.com/coding/v1/usages", {
+      authorization: `Bearer ${key}`,
+      "user-agent": "pi-usage-bar",
+    })) as Record<string, unknown> | null;
+    if (!payload) return null;
+    const root = asTable(payload["data"] ?? payload);
+
+    const windows: UsageWindow[] = [];
+    const usage = asTable(root["usage"]);
+    const usageRow = kimiWindow(usage, {}, "7d");
+    if (usageRow) windows.push(usageRow);
+    const limits = root["limits"];
+    if (Array.isArray(limits)) {
+      for (const item of limits) {
+        const it = asTable(item);
+        const detail = asTable(it["detail"] ?? it);
+        const win = asTable(it["window"]);
+        const row = kimiWindow(detail, win, "7d");
+        if (row) windows.push(row);
+      }
+    }
+    windows.sort(
+      (a, b) => Number(b.category === "5h") - Number(a.category === "5h"),
+    );
+    return windows.length > 0 ? windows : null;
+  },
+};
+
+function kimiNumber(v: unknown): number | undefined {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return undefined;
+}
+
+/** Build a UsageWindow from one Kimi usage/limit row. Null when unusable. */
+function kimiWindow(
+  data: JsonTable,
+  win: JsonTable,
+  fallback: WindowCategory,
+): UsageWindow | null {
+  const limit = kimiNumber(data["limit"]);
+  let used = kimiNumber(data["used"]);
+  if (used === undefined) {
+    const remaining = kimiNumber(data["remaining"]);
+    if (remaining !== undefined && limit !== undefined)
+      used = limit - remaining;
+  }
+  if (used === undefined || limit === undefined || limit <= 0) return null;
+  const percent = Math.min(100, Math.max(0, (used / limit) * 100));
+
+  let resetsAt: number | undefined;
+  for (const k of ["reset_at", "resetAt", "reset_time", "resetTime"]) {
+    const v = data[k];
+    if (typeof v === "string" && v) {
+      const ms = Date.parse(v);
+      if (Number.isFinite(ms)) resetsAt = ms;
+    } else if (typeof v === "number" && Number.isFinite(v) && v > 0) {
+      resetsAt = v > 1e12 ? v : v * 1000; // epoch ms vs seconds
+    }
+    if (resetsAt) break;
+  }
+  if (!resetsAt) {
+    for (const k of ["reset_in", "resetIn", "ttl"]) {
+      const secs = kimiNumber(data[k]);
+      if (secs !== undefined && secs > 0) {
+        resetsAt = Date.now() + Math.round(secs * 1000);
+        break;
+      }
+    }
+  }
+  if (!resetsAt) return null;
+
+  // Classify by window duration when present.
+  let category = fallback;
+  const duration = kimiNumber(win["duration"] ?? data["duration"]);
+  if (duration !== undefined && duration > 0) {
+    const timeUnit = String(win["timeUnit"] ?? data["timeUnit"] ?? "");
+    const unitSecs = timeUnit.includes("MINUTE")
+      ? 60
+      : timeUnit.includes("HOUR")
+        ? 3_600
+        : timeUnit.includes("DAY")
+          ? 86_400
+          : timeUnit.includes("WEEK")
+            ? 604_800
+            : timeUnit.includes("MONTH")
+              ? 2_592_000
+              : 1; // already seconds
+    const secs = duration * unitSecs;
+    category = secs <= 21_600 ? "5h" : secs <= 604_800 ? "7d" : "mo";
+  }
+  return { category, label: category, percent, resetsAt };
+}
+
+const providers: Provider[] = [
+  anthropicProvider,
+  openaiProvider,
+  copilotProvider,
+  zaiProvider,
+  kimiProvider,
+];
 
 // ---------------------------------------------------------------------------
 // Config — ~/.pi/agent/usage-bar.json, auto-created with defaults
@@ -385,15 +658,36 @@ const DEFAULT_CONFIG_JSON = `{
     "enabled": false,
     "show_5h": true,
     "show_7d": false
+  },
+  "github-copilot": {
+    "enabled": false,
+    "show_mo": true
+  },
+  "zai": {
+    "enabled": false,
+    "show_5h": true,
+    "show_7d": false,
+    "show_mo": false,
+    "api_key_env": "ZAI_API_KEY"
+  },
+  "kimi": {
+    "enabled": false,
+    "show_5h": true,
+    "show_7d": false,
+    "api_key_env": "KIMI_API_KEY"
   }
 }
 `;
 
 function defaultConfig(): UsageBarConfig {
-  const show = (): Record<WindowCategory, boolean> => ({
+  const show = (
+    overrides?: Partial<Record<WindowCategory, boolean>>,
+  ): Record<WindowCategory, boolean> => ({
     "5h": true,
     "7d": false,
     model: false,
+    mo: false,
+    ...overrides,
   });
   return {
     showBars: true,
@@ -401,6 +695,10 @@ function defaultConfig(): UsageBarConfig {
     providers: {
       anthropic: { enabled: true, show: show() },
       openai: { enabled: false, show: show() },
+      // Copilot's only window is the monthly premium-requests quota.
+      "github-copilot": { enabled: false, show: show({ "5h": false, mo: true }) },
+      zai: { enabled: false, show: show() },
+      kimi: { enabled: false, show: show() },
     },
   };
 }
@@ -436,15 +734,20 @@ function parseConfig(raw: string): UsageBarConfig {
   )
     cfg.barWidth = Math.min(40, Math.floor(rawWidth));
 
-  for (const id of ["anthropic", "openai"] as ProviderId[]) {
+  for (const id of Object.keys(cfg.providers) as ProviderId[]) {
     const t = asTable(root[id]);
     const p = cfg.providers[id];
     p.enabled = bool(t["enabled"], p.enabled);
     p.show["5h"] = bool(t["show_5h"], p.show["5h"]);
     p.show["7d"] = bool(t["show_7d"], p.show["7d"]);
     p.show.model = bool(t["show_model"], p.show.model);
+    p.show.mo = bool(t["show_mo"], p.show.mo);
     if (id === "anthropic") p.credentialsPath = str(t["credentials_path"]);
     if (id === "openai") p.codexAuthPath = str(t["codex_auth_path"]);
+    if (id === "zai" || id === "kimi") {
+      p.apiKey = str(t["api_key"]);
+      p.apiKeyEnv = str(t["api_key_env"]);
+    }
   }
   return cfg;
 }
