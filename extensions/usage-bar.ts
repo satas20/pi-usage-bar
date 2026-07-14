@@ -294,7 +294,7 @@ const openaiProvider: Provider = {
       // fall through to pi's auth store
     }
     if (!accessToken) {
-      const entry = await piAuth("openai");
+      const entry = await piAuth("openai-codex");
       if (entry?.access && !(entry.expires && Date.now() >= entry.expires)) {
         accessToken = entry.access;
         accountId = entry.accountId;
