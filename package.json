@@ -1,21 +1,51 @@
 {
   "name": "@satas/pi-usage-bar",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "description": "AI subscription usage gauge for the pi coding agent — Claude Pro/Max and ChatGPT Plus/Pro quota bars with provider status (incident) alerts, in the footer.",
   "keywords": [
     "pi-package",
     "pi-coding-agent",
     "pi-agent",
+    "pi",
+    "pi-usage",
+    "pi-quota",
     "usage",
+    "usage-bar",
+    "usage-quota",
+    "usage-limit",
+    "usage-credit",
     "quota",
+    "quota-usage",
+    "quota-limit",
+    "credit",
+    "credits",
+    "credit-usage",
+    "limit",
+    "limits",
     "rate-limit",
+    "footer",
+    "statusline",
     "status",
     "incident",
     "claude",
+    "claude-usage",
+    "claude-quota",
+    "claude-limit",
+    "claude-credit",
     "anthropic",
+    "anthropic-usage",
+    "anthropic-quota",
+    "anthropic-limit",
+    "anthropic-credit",
     "chatgpt",
+    "chatgpt-usage",
+    "chatgpt-quota",
     "codex",
-    "openai"
+    "openai",
+    "openai-usage",
+    "openai-quota",
+    "openai-limit",
+    "openai-credit"
   ],
   "license": "MIT",
   "author": "satas20",
@@ -29,13 +59,15 @@
   },
   "files": [
     "extensions",
+    "docs",
     "README.md",
     "LICENSE"
   ],
   "pi": {
     "extensions": [
       "./extensions/usage-bar.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/satas20/pi-usage-bar/main/docs/preview.png"
   },
   "publishConfig": {
     "access": "public"
