@@ -1,6 +1,6 @@
 {
   "name": "@satas/pi-usage-bar",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "AI subscription usage gauge for the pi coding agent — Claude Pro/Max and ChatGPT Plus/Pro quota bars with provider status (incident) alerts, in the footer.",
   "keywords": [
     "pi-package",
@@ -34,7 +34,7 @@
   ],
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions/usage-bar.ts"
     ]
   },
   "publishConfig": {
