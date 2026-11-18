@@ -33,6 +33,10 @@ During a vendor incident:
 - The countdown ticks live; usage refreshes every 2 minutes (with backoff on
   failures — these endpoints throttle aggressive polling).
 - Last known values are cached, so the bar appears instantly on restart.
+- Multiple pi instances share one cache (`~/.pi/agent/usage-bar-cache/`): only
+  one process polls each provider, and every instance shows the same reading.
+  Readings older than 10 minutes (e.g. after repeated throttling) are marked
+  `(stale …)`.
 - Providers hide silently when credentials are missing/expired or a fetch
   fails; the whole row hides when nothing is available.
 - Provider prefixes (`cld`/`oai`/`cop`/`glm`/`kmi`) appear only when two or
