@@ -29,16 +29,34 @@ import type {
   ExtensionAPI,
   ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { readFile, writeFile, mkdir } from "node:fs/promises";
+import {
+  readFile,
+  writeFile,
+  mkdir,
+  open,
+  rename,
+  stat,
+  unlink,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { Buffer } from "node:buffer";
 
 const POLL_MS = 120_000;
+/** Poll interval after a failed usage fetch (e.g. HTTP 429). */
+const BACKOFF_MS = POLL_MS * 3;
+/** How often each pi process re-reads the shared cache. Cheap: a local file. */
+const SYNC_MS = 10_000;
+/** Readings older than this are flagged as stale in the bar. */
+const STALE_MS = POLL_MS * 5;
 const FETCH_TIMEOUT_MS = 10_000;
+/** A fetch lock older than this belongs to a crashed or hung process. */
+const LOCK_STALE_MS = FETCH_TIMEOUT_MS * 3;
 const AGENT_DIR = join(homedir(), ".pi", "agent");
 const CONFIG_FILE = join(AGENT_DIR, "usage-bar.json");
-const CACHE_FILE = join(AGENT_DIR, "usage-bar-cache.json");
+/** Older single-file cache; read once as a startup seed only. */
+const LEGACY_CACHE_FILE = join(AGENT_DIR, "usage-bar-cache.json");
+const CACHE_DIR = join(AGENT_DIR, "usage-bar-cache");
 const WIDGET_KEY = "usage-bar";
 
 // ---------------------------------------------------------------------------
@@ -776,27 +794,148 @@ async function loadConfig(): Promise<UsageBarConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// Cache — last known windows, so the bar appears instantly on restart
+// Shared cache — one snapshot file per provider, shared by every pi process
+// on the machine. Only the process holding a provider's fetch lock calls the
+// provider's API; every other process picks up the result from the file. This
+// keeps all running instances in sync and avoids N× requests to endpoints
+// that throttle aggressively.
 // ---------------------------------------------------------------------------
 
-type UsageCache = Partial<Record<ProviderId, UsageWindow[]>>;
+type CacheEntry = {
+  /** All windows from the last successful fetch (unfiltered by config). */
+  windows: UsageWindow[];
+  /** epoch ms when the last successful fetch started; 0 = unknown */
+  fetchedAt: number;
+  /** epoch ms when the last fetch attempt (success or failure) started */
+  attemptedAt: number;
+  /** whether that last attempt failed (drives the shared backoff) */
+  failed: boolean;
+  status?: StatusIndicator;
+  /** epoch ms of the last successful status fetch */
+  statusAt?: number;
+};
 
-async function readCache(): Promise<UsageCache> {
+const STATUS_VALUES: readonly StatusIndicator[] = [
+  "none",
+  "minor",
+  "major",
+  "critical",
+  "maintenance",
+];
+
+const num = (v: unknown) =>
+  typeof v === "number" && Number.isFinite(v) ? v : 0;
+
+function parseWindows(v: unknown): UsageWindow[] {
+  if (!Array.isArray(v)) return [];
+  return v.filter(
+    (w): w is UsageWindow =>
+      !!w &&
+      typeof w === "object" &&
+      typeof w.category === "string" &&
+      typeof w.label === "string" &&
+      typeof w.percent === "number" &&
+      typeof w.resetsAt === "number",
+  );
+}
+
+function parseEntry(v: unknown): CacheEntry | undefined {
+  // Legacy format: a bare window array with no timestamps.
+  if (Array.isArray(v))
+    return {
+      windows: parseWindows(v),
+      fetchedAt: 0,
+      attemptedAt: 0,
+      failed: false,
+    };
+  const t = asTable(v);
+  if (!Array.isArray(t["windows"])) return undefined;
+  const status = STATUS_VALUES.find((s) => s === t["status"]);
+  return {
+    windows: parseWindows(t["windows"]),
+    fetchedAt: num(t["fetchedAt"]),
+    attemptedAt: num(t["attemptedAt"]),
+    failed: t["failed"] === true,
+    ...(status ? { status, statusAt: num(t["statusAt"]) } : {}),
+  };
+}
+
+const entryFile = (id: ProviderId) => join(CACHE_DIR, `${id}.json`);
+const lockFile = (id: ProviderId) => join(CACHE_DIR, `${id}.lock`);
+
+async function readEntry(id: ProviderId): Promise<CacheEntry | undefined> {
   try {
-    const raw = JSON.parse(await readFile(CACHE_FILE, "utf8")) as UsageCache;
-    return raw && typeof raw === "object" ? raw : {};
+    return parseEntry(JSON.parse(await readFile(entryFile(id), "utf8")));
   } catch {
-    return {};
+    return undefined;
   }
 }
 
-async function writeCache(cache: UsageCache): Promise<void> {
+async function readLegacyEntry(
+  id: ProviderId,
+): Promise<CacheEntry | undefined> {
   try {
-    await mkdir(AGENT_DIR, { recursive: true });
-    await writeFile(CACHE_FILE, JSON.stringify(cache));
+    const raw = JSON.parse(await readFile(LEGACY_CACHE_FILE, "utf8"));
+    return parseEntry(asTable(raw)[id]);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Atomically replace a provider's snapshot (temp file + rename), never
+ *  replacing a newer successful reading with an older one. */
+async function writeEntry(id: ProviderId, entry: CacheEntry): Promise<void> {
+  try {
+    const current = await readEntry(id);
+    if (current && current.fetchedAt > entry.fetchedAt) return;
+    await mkdir(CACHE_DIR, { recursive: true });
+    const tmp = `${entryFile(id)}.${process.pid}.${Date.now()}.tmp`;
+    await writeFile(tmp, JSON.stringify(entry));
+    await rename(tmp, entryFile(id));
   } catch {
     // best-effort — cache is an optimization only
   }
+}
+
+/** Take a provider's cross-process fetch lock. Returns false if another live
+ *  process holds it. Locks left behind by crashed processes expire. */
+async function acquireLock(id: ProviderId): Promise<boolean> {
+  const file = lockFile(id);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      await mkdir(CACHE_DIR, { recursive: true });
+      const handle = await open(file, "wx");
+      await handle.writeFile(String(process.pid));
+      await handle.close();
+      return true;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "EEXIST") return false;
+      try {
+        const { mtimeMs } = await stat(file);
+        if (Date.now() - mtimeMs < LOCK_STALE_MS) return false;
+        await unlink(file);
+      } catch {
+        // vanished or unreadable — retry once
+      }
+    }
+  }
+  return false;
+}
+
+async function releaseLock(id: ProviderId): Promise<void> {
+  try {
+    await unlink(lockFile(id));
+  } catch {
+    // already gone
+  }
+}
+
+/** Whether a fresh fetch is due, given the shared snapshot. */
+function isDue(entry: CacheEntry | undefined, now: number): boolean {
+  if (!entry) return true;
+  // A timestamp far in the future means a skewed clock — don't wait on it.
+  if (entry.attemptedAt > now + POLL_MS) return true;
+  return now - entry.attemptedAt >= (entry.failed ? BACKOFF_MS : POLL_MS);
 }
 
 // ---------------------------------------------------------------------------
@@ -837,21 +976,23 @@ export default function (pi: ExtensionAPI) {
     const enabled = providers.filter((p) => config.providers[p.id].enabled);
     if (enabled.length === 0) return; // nothing to poll or render
 
-    const byProvider: UsageCache = {};
-    // Usage is seeded from the cache so the bar appears instantly; status is
-    // deliberately not cached across restarts (incidents are short-lived, and
-    // the first poll lands seconds after startup anyway). The seed is filtered
-    // through the *current* config so stale window kinds don't flash.
-    const cached = await readCache();
-    for (const p of enabled) {
-      const windows = cached[p.id];
-      if (Array.isArray(windows))
-        byProvider[p.id] = windows.filter(
-          (w) => config.providers[p.id].show[w.category],
-        );
-    }
+    // Latest known snapshot per provider, kept in sync with the shared cache.
+    // Seeded at startup so the bar appears instantly.
+    const snapshots: Partial<Record<ProviderId, CacheEntry>> = {};
+    const adopt = (id: ProviderId, entry: CacheEntry | undefined) => {
+      const current = snapshots[id];
+      if (!entry) return;
+      if (
+        !current ||
+        entry.fetchedAt > current.fetchedAt ||
+        (entry.fetchedAt === current.fetchedAt &&
+          entry.attemptedAt >= current.attemptedAt)
+      )
+        snapshots[id] = entry;
+    };
+    for (const p of enabled)
+      adopt(p.id, (await readEntry(p.id)) ?? (await readLegacyEntry(p.id)));
     if (gen !== generation) return; // stopped while awaiting
-    const byStatus: Partial<Record<ProviderId, StatusIndicator>> = {};
 
     // -- rendering ----------------------------------------------------------
 
@@ -864,18 +1005,29 @@ export default function (pi: ExtensionAPI) {
         short: string;
         status: StatusIndicator;
         windows: UsageWindow[];
+        /** age of the reading when older than STALE_MS, else 0 */
+        staleMs: number;
       };
       const groups: Group[] = [];
       for (const p of enabled) {
-        // Drop windows that have reset since the last poll.
-        const windows = (byProvider[p.id] ?? []).filter(
-          (w) => w.resetsAt > now,
+        const snap = snapshots[p.id];
+        // Filter through the current config, and drop windows that have
+        // reset since the last poll.
+        const windows = (snap?.windows ?? []).filter(
+          (w) => config.providers[p.id].show[w.category] && w.resetsAt > now,
         );
+        // Incidents are short-lived: ignore a status reading that's too old.
+        const status =
+          snap?.status && now - (snap.statusAt ?? 0) <= STALE_MS
+            ? snap.status
+            : "none";
+        const age = snap && snap.fetchedAt > 0 ? now - snap.fetchedAt : 0;
         if (windows.length > 0)
           groups.push({
             short: p.short,
-            status: byStatus[p.id] ?? "none",
+            status,
             windows,
+            staleMs: age > STALE_MS ? age : 0,
           });
       }
 
@@ -934,6 +1086,10 @@ export default function (pi: ExtensionAPI) {
           win.push(theme.fg("muted", `· ${fmtDuration(w.resetsAt - now)}`));
           seg.push(win.join(" "));
         }
+        // Flag old readings (e.g. after repeated 429s) instead of presenting
+        // them as current.
+        if (g.staleMs > 0)
+          seg.push(theme.fg("warning", `(stale ${fmtDuration(g.staleMs)})`));
         parts.push(seg.join(" "));
       }
 
@@ -947,30 +1103,56 @@ export default function (pi: ExtensionAPI) {
 
     // -- polling ------------------------------------------------------------
 
+    // Every SYNC_MS each process re-reads the provider's shared snapshot.
+    // When a refresh is due (POLL_MS after the last attempt by *any* process,
+    // BACKOFF_MS after a failure), the one process that wins the fetch lock
+    // calls the API and publishes the result; the others adopt it on their
+    // next sync.
     for (const p of enabled) {
       const cfg = config.providers[p.id];
-      const poll = async () => {
-        // Fetch usage and status concurrently; status pages are CDN-backed
-        // and never throttle, so we poll them on the same cadence as usage.
-        const statusP =
-          config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null;
-        const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP]);
-        if (gen !== generation) return; // session ended while fetching
-        if (all) {
-          const windows = all.filter(
-            (w) => cfg.show[w.category] && w.resetsAt > Date.now(),
-          );
-          byProvider[p.id] = windows;
-          void writeCache(byProvider);
+      const fetchShared = async (): Promise<void> => {
+        if (!(await acquireLock(p.id))) return; // another process is on it
+        try {
+          // Re-check under the lock: someone may have just published.
+          const prev = await readEntry(p.id);
+          adopt(p.id, prev);
+          if (!isDue(prev, Date.now())) return;
+          const startedAt = Date.now();
+          // Fetch usage and status concurrently; status pages are CDN-backed
+          // and never throttle, so we poll them on the same cadence as usage.
+          const statusP =
+            config.showStatus && p.statusUrl ? fetchStatus(p.statusUrl) : null;
+          const [all, status] = await Promise.all([p.fetchUsage(cfg), statusP]);
+          const base = prev ?? snapshots[p.id];
+          // A failed fetch keeps the last good windows; `null` status means
+          // the status fetch failed — keep the last known indicator.
+          const next: CacheEntry = {
+            windows: all ?? base?.windows ?? [],
+            fetchedAt: all ? startedAt : (base?.fetchedAt ?? 0),
+            attemptedAt: startedAt,
+            failed: !all,
+            ...(status !== null
+              ? { status, statusAt: startedAt }
+              : base?.status
+                ? { status: base.status, statusAt: base.statusAt }
+                : {}),
+          };
+          await writeEntry(p.id, next);
+          adopt(p.id, next);
+        } finally {
+          await releaseLock(p.id);
         }
-        // `null` means the status fetch failed — keep the last known indicator.
-        if (status !== null) byStatus[p.id] = status;
-        render();
-        // Back off when the usage fetch failed (e.g. 429 — these endpoints
-        // throttle aggressive polling).
-        timers.set(p.id, setTimeout(poll, all ? POLL_MS : POLL_MS * 3));
       };
-      void poll();
+      const sync = async () => {
+        adopt(p.id, await readEntry(p.id));
+        if (gen !== generation) return; // session ended while reading
+        const due = isDue(snapshots[p.id], Date.now());
+        if (due) await fetchShared();
+        if (gen !== generation) return; // session ended while fetching
+        render();
+        timers.set(p.id, setTimeout(sync, SYNC_MS));
+      };
+      void sync();
     }
 
     // Live countdown; setStatus is only called when the rendered line changes
